@@ -1,0 +1,43 @@
+name: words
+# Idegen nyelvű szavak listája (scraper/foreign_words.py) a fordító szótárhoz. Kézzel: Actions → words → Run workflow.
+# Eredmény: a futás oldalán alul az „idegen-szavak” csatolmány (CSV) letölthető.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  D1_API_URL: ${{ vars.D1_API_URL }}
+  D1_API_TOKEN: ${{ secrets.D1_API_TOKEN }}
+
+jobs:
+  words:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: python scraper/foreign_words.py
+      - name: jelszavas zip (idegen-szavak)
+        if: always()
+        continue-on-error: true
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          files=$(ls idegen_szavak.csv 2>/dev/null || true)
+          if [ -n "$files" ]; then 7z a -tzip -mem=ZipCrypto -p"$ARTIFACT_PASSWORD" idegen-szavak.zip $files >/dev/null; fi
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true      # a GitHub tárhelye néha hibázik: a CSV nem kritikus, a futás ettől még sikeres
+        timeout-minutes: 3
+        with:
+          name: idegen-szavak
+          path: idegen-szavak.zip
+          retention-days: 7

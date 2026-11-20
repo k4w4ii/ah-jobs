@@ -1,0 +1,76 @@
+name: ai-review
+
+# AI-ellenőrzés JAVASLAT-MÓDBAN (Gemini 3.1 Flash-Lite): a termékkategóriák átnézése a szabályrendszer
+# (scraper/ai_szabalyok.md) szerint. Az oldalt NEM írja át: az eltérések listája (ai_javaslatok.csv) a futás oldalán,
+# Artifacts alatt tölthető le, és ebből lesznek az új besorolási szabályok.
+# Kézi indítás: Actions -> ai-review -> Run workflow. becsles = árbecslés, eles = átnézés + lista, lista = csak a lista.
+# Minden terméket csak egyszer néz át; ha elfogy a napi keret, a következő futás onnan folytatja.
+# Az éjszakai frissítés (daily-scrape) is lefuttatja, kis kerettel, az új termékekre.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "becsles = árbecslés, eles = átnézés + javaslat-lista, lista = csak a lista (API nélkül)"
+        type: choice
+        options: [becsles, eles, lista]
+        default: becsles
+      max_requests:
+        description: "Legfeljebb ennyi kérés (1 kérés = 100 termék)"
+        type: string
+        default: "50"
+      reset:
+        description: "Újra mindent (a korábbi AI-döntések törlése, pl. a szabályfájl módosítása után)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airsofthunter-db
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  D1_API_URL: ${{ vars.D1_API_URL }}
+  D1_API_TOKEN: ${{ secrets.D1_API_TOKEN }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Tesztek
+        run: python -m unittest discover -s scraper -q
+      - name: AI-ellenőrzés
+        run: python scraper/ai_review.py
+        env:
+          AI_DRY_RUN: ${{ inputs.mode == 'becsles' && '1' || '0' }}
+          AI_LIST_ONLY: ${{ inputs.mode == 'lista' && '1' || '0' }}
+          AI_MAX_REQUESTS: ${{ inputs.max_requests }}
+          AI_RESET: ${{ inputs.reset && '1' || '0' }}
+      - name: jelszavas zip (ai-javaslatok)
+        if: always()
+        continue-on-error: true
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          files=$(ls ai_javaslatok.csv ai_osszes.csv 2>/dev/null || true)
+          if [ -n "$files" ]; then 7z a -tzip -mem=ZipCrypto -p"$ARTIFACT_PASSWORD" ai-javaslatok.zip $files >/dev/null; fi
+      - uses: actions/upload-artifact@v4       # javaslat-lista: ezt küldd el a szabályok frissítéséhez
+        continue-on-error: true
+        timeout-minutes: 3
+        if: always()
+        with:
+          name: ai-javaslatok
+          path: ai-javaslatok.zip
+          if-no-files-found: ignore
+          retention-days: 30

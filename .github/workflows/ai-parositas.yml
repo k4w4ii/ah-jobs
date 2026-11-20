@@ -1,0 +1,69 @@
+name: ai-parositas
+
+# AI-párosítás JAVASLAT-MÓDBAN (Gemini): ugyanaz a termék két boltban, két külön néven? Az oldalt NEM írja át.
+# Az eredmény (ai_parositas.csv) a futás oldalán, Artifacts alatt tölthető le. Összevonás csak az átnézett, jóváhagyott
+# párokra történik: azok a scraper/osszevonasok.json fájlba kerülnek, és a napi futás (rematch) hajtja végre.
+# Kézi indítás: Actions -> ai-parositas -> Run workflow. becsles = hány pár, mennyibe kerülne; eles = kérdezés + lista.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "becsles = csak számolás, eles = kérdezés + lista, lista = csak a lista (API nélkül)"
+        type: choice
+        options: [becsles, eles, lista]
+        default: becsles
+      max_requests:
+        description: "Legfeljebb ennyi kérés (1 kérés = 60 pár)"
+        type: string
+        default: "80"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airsofthunter-db
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  D1_API_URL: ${{ vars.D1_API_URL }}
+  D1_API_TOKEN: ${{ secrets.D1_API_TOKEN }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+jobs:
+  ai-parositas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Tesztek
+        run: python -m unittest discover -s scraper -q
+      - name: AI-párosítás (javaslat)
+        run: python scraper/ai_match.py
+        env:
+          AI_DRY_RUN: ${{ inputs.mode == 'becsles' && '1' || '0' }}
+          AI_LIST_ONLY: ${{ inputs.mode == 'lista' && '1' || '0' }}
+          AI_MAX_REQUESTS: ${{ inputs.max_requests }}
+      - name: jelszavas zip (ai-parositas)
+        if: always()
+        continue-on-error: true
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          files=$(ls ai_parositas.csv 2>/dev/null || true)
+          if [ -n "$files" ]; then 7z a -tzip -mem=ZipCrypto -p"$ARTIFACT_PASSWORD" ai-parositas.zip $files >/dev/null; fi
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 3
+        if: always()
+        with:
+          name: ai-parositas
+          path: ai-parositas.zip
+          if-no-files-found: ignore
+          retention-days: 30

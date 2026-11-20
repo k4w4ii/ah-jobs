@@ -1,0 +1,189 @@
+name: daily-scrape
+
+on:
+  # Fő indítás: a Cloudflare Worker időzítője 02:17 UTC-kor pontosan elindítja (web/custom-worker.js, GH_TOKEN).
+  # Ez a GitHub-ütemezés csak tartalék: ha aznap még nem futott (a GitHub-időzítő órákat késhet), elindul.
+  schedule:
+    - cron: "47 6 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max termék / bolt (teszthez)"
+        required: false
+        type: number
+
+# a GITHUB_TOKEN csak olvashat (a scraper nem ír a repóba); actions: read a tartalék-ellenőrzéshez
+permissions:
+  contents: read
+  actions: read
+
+# a kézi újrapárosítás (rematch) megvárja, amíg ez fut, és fordítva
+concurrency:
+  group: airsofthunter-db
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"       # a napló azonnal látszik (nem pufferelve)
+  # Cloudflare D1 (a weboldal titkos /api/db végpontján át)
+  D1_API_URL: ${{ vars.D1_API_URL }}
+  D1_API_TOKEN: ${{ secrets.D1_API_TOKEN }}
+
+jobs:
+  # tartalék indításnál: ha az elmúlt 22 órában már indult napi futás, ez kimarad
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          since=$(date -u -d '-22 hours' +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow daily-scrape.yml --created ">=$since" --limit 20 \
+                --json databaseId --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID)] | length")
+          if [ "${n:-0}" -gt 0 ]; then echo "Ma már futott – a tartalék indítás kimarad."; echo "go=false" >> "$GITHUB_OUTPUT"
+          else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+
+  rates:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: python scraper/mnb_rates.py
+
+  # a boltlista a scraper/shops.json-ból jön (a letiltott boltok nem indulnak el); a tesztek a gyűjtés ELŐTT futnak
+  plan:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shops: ${{ steps.list.outputs.shops }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: python -m unittest discover -s scraper -q
+      - id: list
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("scraper/shops.json", encoding="utf-8"))
+          print("shops=" + json.dumps([k for k, v in d.items() if isinstance(v, dict) and v.get("enabled", True)]))
+          PY
+
+  scrape:
+    needs: [rates, plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 330          # GitHub max. 360; a scraper 300 perc után magától leáll és ment
+    env:
+      SCRAPE_BUDGET_MIN: "300"
+    strategy:
+      fail-fast: false           # egy bolt hibája ne állítsa le a többit
+      max-parallel: 6
+      matrix:
+        shop: ${{ fromJSON(needs.plan.outputs.shops) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      # a kézi „limit” érték környezeti változóként megy át, nem kerül közvetlenül a parancssorba
+      - run: echo "| bolt | ajánlat | új | hiba | első hiba |" >> "$GITHUB_STEP_SUMMARY"; echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+      - env:
+          SHOP: ${{ matrix.shop }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            case "$LIMIT" in (*[!0-9]*) echo "hibás limit"; exit 1;; esac
+            python scraper/run_shop.py "$SHOP" --limit "$LIMIT"
+          else
+            python scraper/run_shop.py "$SHOP"
+          fi
+
+  # a végén: jellemző-audit (BB-súly, gáz, rugó...), a leválasztott ajánlatok újrapárosítása,
+  # névegységesítés és a weboldal frissítése (scraper/rematch.py)
+  refresh:
+    needs: [gate, scrape]
+    if: always() && needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Tesztek (hibás besoroló kód soha nem ír az adatbázisba)
+        run: python -m unittest discover -s scraper -q
+      - name: AI-ellenőrzés, javaslat-mód (Gemini, csak az új termékek; az oldalt nem írja át; kulcs nélkül kihagyja)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: python scraper/ai_review.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_MAX_REQUESTS: "10"
+      - run: python scraper/rematch.py
+      - name: Ár- és készletfigyelő e-mailek (kulcs nélkül kihagyja; hiba esetén is továbbmegy)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: python scraper/alerts.py
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+      - name: jelszavas zip (minoseg)
+        if: always()
+        continue-on-error: true
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          files=$(ls minoseg.csv ai_javaslatok.csv 2>/dev/null || true)
+          if [ -n "$files" ]; then 7z a -tzip -mem=ZipCrypto -p"$ARTIFACT_PASSWORD" minoseg.zip $files >/dev/null; fi
+      - uses: actions/upload-artifact@v4       # minőség-őr: javított és ellenőrizendő termékek listája
+        continue-on-error: true      # a GitHub tárhelye néha hibázik: a CSV nem kritikus, a futás ettől még sikeres
+        timeout-minutes: 3
+        if: always()
+        with:
+          name: minoseg
+          path: minoseg.zip
+          if-no-files-found: ignore
+          retention-days: 14
+      # Next.js ISR újraépítés (opcionális): curl -X POST "$REVALIDATE_URL?secret=$REVALIDATE_SECRET"
+
+  # legvégül: állapot-ellenőrzés (adatbázis + weboldal); ha piros, a GitHub e-mailt küld
+  health:
+    needs: [gate, refresh]
+    if: always() && needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - run: python scraper/health_check.py
