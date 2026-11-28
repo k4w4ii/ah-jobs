@@ -1,0 +1,60 @@
+name: rematch
+
+# Kézi indítás: Actions -> rematch -> Run workflow. Letöltés nélkül újrapárosítja a 'pending' ajánlatokat,
+# egységesíti a termékneveket és frissíti a weboldalt (pár perc). Takarító SQL (pl. 0012) után futtasd.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Szándékos tömeges átsorolás (a biztosíték megkerülése)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# ne fusson egyszerre az éjszakai letöltéssel (megvárja)
+concurrency:
+  group: airsofthunter-db
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"       # a napló azonnal látszik (nem pufferelve)
+  # Cloudflare D1 (a weboldal titkos /api/db végpontján át)
+  D1_API_URL: ${{ vars.D1_API_URL }}
+  D1_API_TOKEN: ${{ secrets.D1_API_TOKEN }}
+
+jobs:
+  rematch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: kódcsomag kicsomagolása
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: gpg --batch --quiet --yes --pinentry-mode loopback --passphrase "$BUNDLE_KEY" -d bundle.tgz.gpg | tar xz
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Tesztek (hibás besoroló kód soha nem ír az adatbázisba)
+        run: python -m unittest discover -s scraper -q
+      - run: python scraper/rematch.py
+        env:
+          FORCE_RECLASSIFY: ${{ inputs.force && '1' || '0' }}
+      - name: jelszavas zip (minoseg)
+        if: always()
+        continue-on-error: true
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          files=$(ls minoseg.csv 2>/dev/null || true)
+          if [ -n "$files" ]; then 7z a -tzip -mem=ZipCrypto -p"$ARTIFACT_PASSWORD" minoseg.zip $files >/dev/null; fi
+      - uses: actions/upload-artifact@v4       # minőség-őr: javított és ellenőrizendő termékek listája
+        continue-on-error: true      # a GitHub tárhelye néha hibázik: a CSV nem kritikus, a futás ettől még sikeres
+        timeout-minutes: 3
+        if: always()
+        with:
+          name: minoseg
+          path: minoseg.zip
+          if-no-files-found: ignore
+          retention-days: 14
